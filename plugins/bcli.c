@@ -63,7 +63,8 @@ static void add_arg(const char ***args, const char *arg TAKES)
 }
 
 /* If stdinargs is non-NULL, that is where we put additional args */
-static const char **gather_argsv(const tal_t *ctx, const char ***stdinargs, const char *cmd, va_list ap)
+static const char **gather_argsv(const tal_t *ctx, const char ***stdinargs,
+				 const char *cmd, va_list ap)
 {
 	const char **args = tal_arr(ctx, const char *, 1);
 	const char *arg;
@@ -74,14 +75,15 @@ static const char **gather_argsv(const tal_t *ctx, const char ***stdinargs, cons
 	if (bitcoind->datadir)
 		add_arg(&args, tal_fmt(args, "-datadir=%s", bitcoind->datadir));
 	if (bitcoind->rpcclienttimeout) {
-		/* Use the maximum value of rpcclienttimeout and retry_timeout to avoid
-		   the bitcoind backend hanging for too long. */
+		/* Use the maximum value of rpcclienttimeout and
+		   retry_timeout to avoid bitcoind hanging too long. */
 		if (bitcoind->retry_timeout &&
 		    bitcoind->retry_timeout > bitcoind->rpcclienttimeout)
 			bitcoind->rpcclienttimeout = bitcoind->retry_timeout;
 
 		add_arg(&args,
-			tal_fmt(args, "-rpcclienttimeout=%"PRIu64, bitcoind->rpcclienttimeout));
+			tal_fmt(args, "-rpcclienttimeout=%"PRIu64,
+				bitcoind->rpcclienttimeout));
 	}
 	if (bitcoind->rpcconnect)
 		add_arg(&args,
@@ -92,11 +94,12 @@ static const char **gather_argsv(const tal_t *ctx, const char ***stdinargs, cons
 	if (bitcoind->rpcuser)
 		add_arg(&args, tal_fmt(args, "-rpcuser=%s", bitcoind->rpcuser));
 	if (bitcoind->rpcpass)
-		// Always pipe the rpcpassword via stdin. Do not pass it using an
-		// `-rpcpassword` argument - secrets in arguments can leak when listing
-		// system processes.
+		/* Always pipe the rpcpassword via stdin. Do not pass it using
+		   an `-rpcpassword` argument - secrets in arguments can leak
+		   when listing system processes. */
 		add_arg(&args, "-stdinrpcpass");
-	/* To avoid giant command lines, we use -stdin (avail since bitcoin 0.13) */
+	/* To avoid giant command lines, we use -stdin (avail since bitcoin
+	   0.13) */
 	if (stdinargs)
 		add_arg(&args, "-stdin");
 
@@ -309,7 +312,8 @@ static struct command_result *process_getutxout(struct bitcoin_cli *bcli)
 	return command_finished(bcli->cmd, response);
 }
 
-static struct command_result *process_getblockchaininfo(struct bitcoin_cli *bcli)
+static struct command_result *
+process_getblockchaininfo(struct bitcoin_cli *bcli)
 {
 	const jsmntok_t *tokens;
 	struct json_stream *response;
@@ -419,7 +423,8 @@ estimatefees_parse_feerate(struct bitcoin_cli *bcli, u64 *feerate)
 	return NULL;
 }
 
-static struct command_result *process_sendrawtransaction(struct bitcoin_cli *bcli)
+static struct command_result *
+process_sendrawtransaction(struct bitcoin_cli *bcli)
 {
 	struct json_stream *response;
 
@@ -802,11 +807,14 @@ static void parse_getnetworkinfo_result(struct plugin *p, const char *buf)
 	const char *err;
 
 	result = json_parse_simple(NULL, buf, strlen(buf));
-	if (!result)
+	if (!result) {
+		const char **cmd = gather_args(bitcoind, NULL,
+					       "getnetworkinfo", NULL);
+		char *cmd_str = args_string(tmpctx, cmd, NULL);
 		plugin_err(p, "Invalid response to '%s': '%s'. Can not "
 			      "continue without proceeding to sanity checks.",
-			   args_string(tmpctx, gather_args(bitcoind, NULL, "getnetworkinfo", NULL), NULL),
-			   buf);
+			   cmd_str, buf);
+	}
 
 	/* Check that we have a fully-featured `estimatesmartfee`. */
 	err = json_scan(tmpctx, buf, result, "{version:%,localrelay:%}",
@@ -951,7 +959,8 @@ int main(int argc, char *argv[])
 	/* Initialize our global context object here to handle startup options. */
 	bitcoind = new_bitcoind(NULL);
 
-	plugin_main(argv, init, NULL, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC,
+		    false, /* Do not init RPC on startup */
 		    NULL, commands, ARRAY_SIZE(commands),
 		    NULL, 0, NULL, 0, NULL, 0,
 		    plugin_option("bitcoin-datadir",
@@ -980,20 +989,26 @@ int main(int argc, char *argv[])
 				  charp_option, NULL, &bitcoind->rpcport),
 		    plugin_option("bitcoin-rpcclienttimeout",
 				  "int",
-				  "bitcoind RPC timeout in seconds during HTTP requests",
-				  u64_option, u64_jsonfmt, &bitcoind->rpcclienttimeout),
+				  "bitcoind RPC timeout in seconds "
+				  "during HTTP requests",
+				  u64_option, u64_jsonfmt,
+				  &bitcoind->rpcclienttimeout),
 		    plugin_option("bitcoin-retry-timeout",
 				  "int",
-				  "how long to keep retrying to contact bitcoind"
-				  " before fatally exiting",
-				  u64_option, u64_jsonfmt, &bitcoind->retry_timeout),
+				  "how long to keep retrying to contact "
+				  "bitcoind before fatally exiting",
+				  u64_option, u64_jsonfmt,
+				  &bitcoind->retry_timeout),
 		    plugin_option_dev("dev-no-fake-fees",
 				      "bool",
 				      "Suppress fee faking for regtest",
-				      bool_option, NULL, &bitcoind->dev_no_fake_fees),
+				      bool_option, NULL,
+				      &bitcoind->dev_no_fake_fees),
 		    plugin_option_dev("dev-ignore-ibd",
 				      "bool",
-				      "Never tell lightningd we're doing initial block download",
-				      bool_option, NULL, &bitcoind->dev_ignore_ibd),
+				      "Never tell lightningd we're doing "
+				      "initial block download",
+				      bool_option, NULL,
+				      &bitcoind->dev_ignore_ibd),
 		    NULL);
 }
