@@ -10,6 +10,7 @@
 #include <common/memleak.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <unistd.h>
 #include <plugins/libplugin.h>
 
 #define RPC_TRANSACTION_ALREADY_IN_CHAIN -27
@@ -30,6 +31,7 @@ struct bitcoind {
 	/* Passthrough parameters for bitcoin-cli */
 	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
 	u64 rpcclienttimeout;
+	u64 retry_timeout;
 
 	/* Whether we fake fees (regtest) */
 	bool fake_fees;
@@ -131,6 +133,7 @@ gather_args(const tal_t *ctx, const char ***stdinargs, const char *cmd, ...)
 /* Execute bitcoin-cli command synchronously and return output */
 static struct bitcoin_cli *run_bitcoin_cli(const tal_t *ctx,
 					   struct command *cmd,
+					   const char *name,
 					   const char **args,
 					   const char **stdinargs)
 {
@@ -140,7 +143,6 @@ static struct bitcoin_cli *run_bitcoin_cli(const tal_t *ctx,
 	int status;
 	int ret;
 	char *buf;
-	size_t len;
 
 	bcli->args = args;
 	bcli->stdinargs = stdinargs;
@@ -151,48 +153,101 @@ static struct bitcoin_cli *run_bitcoin_cli(const tal_t *ctx,
 
 	pid = pipecmdarr(&in, &from, &from,
 			 cast_const2(char **, args));
-	if (pid < 0)
-		plugin_err(cmd->plugin, "%s exec failed: %s",
-			   args[0], strerror(errno));
+	if (pid < 0) {
+		bcli->exitstatus = -1;
+		bcli->output = tal_fmt(bcli, "%s exec failed: %s",
+				       args[0], strerror(errno));
+		return bcli;
+	}
 
 	if (bitcoind->rpcpass) {
 		if (!write_all(in, bitcoind->rpcpass,
-			       strlen(bitcoind->rpcpass)))
-			plugin_err(cmd->plugin, "write rpcpass failed: %s",
-				   strerror(errno));
-		if (!write_all(in, "\n", 1))
-			plugin_err(cmd->plugin, "write newline failed: %s",
-				   strerror(errno));
+			       strlen(bitcoind->rpcpass))) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "write rpcpass failed: %s",
+					       strerror(errno));
+			close(in);
+			close(from);
+			goto wait;
+		}
+		if (!write_all(in, "\n", 1)) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "write newline failed: %s",
+					       strerror(errno));
+			close(in);
+			close(from);
+			goto wait;
+		}
 	}
 
 	for (size_t i = 0; i < tal_count(stdinargs); i++) {
-		if (!write_all(in, stdinargs[i], strlen(stdinargs[i])))
-			plugin_err(cmd->plugin,
+		if (!write_all(in, stdinargs[i], strlen(stdinargs[i]))) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli,
 				   "write stdin arg failed: %s",
 				   strerror(errno));
-		if (!write_all(in, "\n", 1))
-			plugin_err(cmd->plugin, "write newline failed: %s",
-				   strerror(errno));
+			close(in);
+			close(from);
+			goto wait;
+		}
+		if (!write_all(in, "\n", 1)) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "write newline failed: %s",
+					       strerror(errno));
+			close(in);
+			close(from);
+			goto wait;
+		}
 	}
 	close(in);
 
 	buf = grab_fd_str(bcli, from);
-	if (!buf)
-		plugin_err(cmd->plugin, "grab_fd_str failed");
+	/* grab_fd_str closes fd */
 
+	if (buf) {
+		bcli->output = buf;
+		bcli->output_bytes = strlen(buf);
+	}
+
+wait:
 	while ((ret = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
 		;
-	if (ret != pid)
-		plugin_err(cmd->plugin, "%s waitpid: %s", args[0],
-			   ret == 0 ? "not exited?" : strerror(errno));
+	if (ret != pid) {
+		if (bcli->exitstatus == 0) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "%s waitpid: %s", args[0],
+				   ret == 0 ? "not exited?" : strerror(errno));
+		}
+		return bcli;
+	}
 
-	if (!WIFEXITED(status))
-		plugin_err(cmd->plugin, "%s died with signal %i",
-			   args[0], WTERMSIG(status));
+	if (!WIFEXITED(status)) {
+		if (bcli->exitstatus == 0) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "%s died with signal %i",
+				   args[0], WTERMSIG(status));
+		}
+		return bcli;
+	}
+
+	if (bcli->exitstatus != 0)
+		return bcli;
 
 	bcli->exitstatus = WEXITSTATUS(status);
-	bcli->output = buf;
-	bcli->output_bytes = strlen(buf);
+
+	if (bcli->exitstatus != 0)
+		plugin_log(cmd->plugin, LOG_UNUSUAL, "%s command exited with status %d",
+			   name, bcli->exitstatus);
+
+	if (!bcli->output) {
+		if (bcli->exitstatus == 0) {
+			bcli->exitstatus = -1;
+			bcli->output = tal_fmt(bcli, "grab_fd_str failed");
+		} else {
+			bcli->output = tal_strdup(bcli, "");
+			bcli->output_bytes = 0;
+		}
+	}
 
 	return bcli;
 }
@@ -221,32 +276,7 @@ static char *args_string(const tal_t *ctx, const char **args,
 	return ret;
 }
 
-/* Synchronous wrapper to execute bitcoin-cli and process result */
-static struct command_result *run_bcli(struct command *cmd,
-				       struct command_result *
-				       (*process)(struct bitcoin_cli *),
-				       bool nonzero_exit_ok,
-				       const char *method,
-				       va_list ap)
-{
-	const char **stdinargs = tal_arr(cmd, const char *, 0);
-	const char **args = gather_argsv(cmd, &stdinargs, method, ap);
-	struct bitcoin_cli *bcli;
-	struct command_result *res;
 
-	bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
-
-	if (!nonzero_exit_ok && bcli->exitstatus != 0) {
-		char *err_str = tal_strndup(cmd, bcli->output,
-					    bcli->output_bytes);
-		return command_done_err(cmd, BCLI_ERROR, err_str, NULL);
-	}
-
-	res = process(bcli);
-	tal_free(bcli);
-
-	return res;
-}
 
 static void strip_trailing_whitespace(char *str, size_t len)
 {
@@ -495,7 +525,6 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 	u32 *height;
 	const char **args, **stdinargs;
 	struct bitcoin_cli *bcli_hash, *bcli_block;
-	const jsmntok_t *tokens;
 
 	/* bitcoin-cli wants a string. */
 	if (!param(cmd, buf, toks,
@@ -512,16 +541,11 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 	args = gather_args(cmd, &stdinargs, "getblockhash",
 			   take(tal_fmt(NULL, "%u", stash->block_height)),
 			   NULL);
-	bcli_hash = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli_hash = run_bitcoin_cli(cmd, cmd, "getblockhash", args, stdinargs);
 
 	if (bcli_hash->exitstatus != 0) {
-		if (bcli_hash->exitstatus == 8) {
-			tal_free(bcli_hash);
-			return getrawblockbyheight_notfound(cmd);
-		}
-		return command_done_err(cmd, BCLI_ERROR,
-					tal_strdup(cmd, bcli_hash->output),
-					NULL);
+		tal_free(bcli_hash);
+		return getrawblockbyheight_notfound(cmd);
 	}
 
 	strip_trailing_whitespace(bcli_hash->output,
@@ -538,7 +562,7 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 	stdinargs = tal_arr(cmd, const char *, 0);
 	args = gather_args(cmd, &stdinargs, "getblock",
 			   stash->block_hash, "0", NULL);
-	bcli_block = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli_block = run_bitcoin_cli(cmd, cmd, "getblock", args, stdinargs);
 
 	if (bcli_block->exitstatus != 0) {
 		tal_free(bcli_block);
@@ -547,7 +571,6 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 
 	bcli_block->stash = stash;
 	struct command_result *res = process_rawblock(bcli_block);
-	tal_free(bcli_block);
 	return res;
 }
 
@@ -570,7 +593,7 @@ static struct command_result *getchaininfo(struct command *cmd,
 
 	stdinargs = tal_arr(cmd, const char *, 0);
 	args = gather_args(cmd, &stdinargs, "getblockchaininfo", NULL);
-	bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli = run_bitcoin_cli(cmd, cmd, "getblockchaininfo", args, stdinargs);
 
 	if (bcli->exitstatus != 0)
 		return command_done_err(cmd, BCLI_ERROR,
@@ -578,7 +601,6 @@ static struct command_result *getchaininfo(struct command *cmd,
 					NULL);
 
 	struct command_result *res = process_getblockchaininfo(bcli);
-	tal_free(bcli);
 	return res;
 }
 
@@ -674,7 +696,7 @@ static struct command_result *estimatefees(struct command *cmd,
 	/* Get mempoolinfo */
 	stdinargs = tal_arr(cmd, const char *, 0);
 	args = gather_args(cmd, &stdinargs, "getmempoolinfo", NULL);
-	bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli = run_bitcoin_cli(cmd, cmd, "getmempoolinfo", args, stdinargs);
 
 	if (bcli->exitstatus != 0) {
 		tal_free(bcli);
@@ -684,7 +706,6 @@ static struct command_result *estimatefees(struct command *cmd,
 	bcli->stash = stash;
 	res = getminfees_done(bcli);
 	if (res) {
-		tal_free(bcli);
 		return res;
 	}
 	tal_free(bcli);
@@ -698,13 +719,12 @@ static struct command_result *estimatefees(struct command *cmd,
 					     estimatefee_params[i].blocks)),
 				   estimatefee_params[i].style,
 				   NULL);
-		bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+		bcli = run_bitcoin_cli(cmd, cmd, "estimatesmartfee", args, stdinargs);
 
 		if (bcli->exitstatus == 0) {
 			bcli->stash = stash;
 			res = estimatefees_done(bcli);
 			if (res) {
-				tal_free(bcli);
 				return res;
 			}
 		}
@@ -755,10 +775,9 @@ static struct command_result *sendrawtransaction(struct command *cmd,
 	stdinargs = tal_arr(cmd, const char *, 0);
 	args = gather_args(cmd, &stdinargs, "sendrawtransaction",
 			   tx, highfeesarg, NULL);
-	bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli = run_bitcoin_cli(cmd, cmd, "sendrawtransaction", args, stdinargs);
 
 	struct command_result *res = process_sendrawtransaction(bcli);
-	tal_free(bcli);
 	return res;
 }
 
@@ -779,10 +798,9 @@ static struct command_result *getutxout(struct command *cmd,
 
 	stdinargs = tal_arr(cmd, const char *, 0);
 	args = gather_args(cmd, &stdinargs, "gettxout", txid, vout, NULL);
-	bcli = run_bitcoin_cli(cmd, cmd, args, stdinargs);
+	bcli = run_bitcoin_cli(cmd, cmd, "gettxout", args, stdinargs);
 
 	struct command_result *res = process_getutxout(bcli);
-	tal_free(bcli);
 	return res;
 }
 
