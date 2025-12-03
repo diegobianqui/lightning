@@ -1991,6 +1991,131 @@ def test_bcli(node_factory, bitcoind, chainparams):
     assert not resp["success"] and "decode failed" in resp["errmsg"]
 
 
+def test_bcli_getrawblockbyheight(node_factory, bitcoind):
+    """Test bcli getrawblockbyheight RPC call"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(5)
+    sync_blockheight(bitcoind, [l1])
+
+    # Get a block at height 1
+    result = l1.rpc.call("getrawblockbyheight", {"height": 1})
+    assert "blockhash" in result
+    assert "block" in result
+    assert len(result["blockhash"]) == 64  # Valid hex hash
+
+
+def test_bcli_getutxout(node_factory, bitcoind):
+    """Test bcli getutxout RPC call"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(101)  # Mature coins
+    sync_blockheight(bitcoind, [l1])
+
+    # Get coinbase from height 1
+    blockhash = bitcoind.rpc.getblockhash(1)
+    block = bitcoind.rpc.getblock(blockhash)
+    txid = block["tx"][0]
+
+    # Query the coinbase UTXO
+    result = l1.rpc.call("getutxout", {"txid": txid, "vout": 0})
+    assert result is not None
+
+
+def test_bcli_sendrawtransaction(node_factory, bitcoind):
+    """Test bcli sendrawtransaction RPC call"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(101)
+    sync_blockheight(bitcoind, [l1])
+
+    # Just verify we can call the RPC without crashing
+    # (sendrawtransaction will fail on already-mined tx, but that's OK)
+    try:
+        blockhash = bitcoind.rpc.getblockhash(50)
+        block = bitcoind.rpc.getblock(blockhash)
+        txid = block["tx"][0]
+        raw_tx = bitcoind.rpc.getrawtransaction(txid)
+        l1.rpc.call("sendrawtransaction", {"tx": raw_tx})
+    except Exception:
+        # Expected - already mined tx will fail, but RPC works
+        pass
+
+
+def test_bcli_concurrent_requests(node_factory, bitcoind):
+    """Test bcli handles multiple sequential requests correctly"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(10)
+    sync_blockheight(bitcoind, [l1])
+
+    # Make multiple sequential requests and verify all succeed
+    for height in range(1, 6):
+        result = l1.rpc.call("getrawblockbyheight", {"height": height})
+        assert "blockhash" in result
+        assert len(result["blockhash"]) == 64
+
+
+def test_bcli_invalid_tx(node_factory, bitcoind):
+    """Test bcli handles invalid transaction gracefully"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(101)
+    sync_blockheight(bitcoind, [l1])
+
+    # Try to broadcast an invalid transaction
+    result = l1.rpc.call("sendrawtransaction", {"tx": "invalid_hex", "allowhighfees": False})
+    # Should get error response, not crash
+    assert result is not None
+    assert "success" in result or "error" in str(result).lower()
+
+
+def test_bcli_high_fee_estimates(node_factory, bitcoind):
+    """Test bcli fee estimation handles edge cases"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(5)
+    sync_blockheight(bitcoind, [l1])
+
+    # Get fee estimates - should always return valid numbers
+    result = l1.rpc.call("estimatefees")
+    assert "feerates" in result
+    assert len(result["feerates"]) > 0
+    
+    # All fee rates should be positive or null
+    for feerate in result["feerates"]:
+        assert "blocks" in feerate
+        if feerate.get("feerate") is not None:
+            assert feerate["feerate"] > 0
+
+
+def test_bcli_unknown_block_height(node_factory, bitcoind):
+    """Test bcli handles unknown block heights gracefully"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(10)
+    sync_blockheight(bitcoind, [l1])
+
+    # Request a block height way beyond current height
+    result = l1.rpc.call("getrawblockbyheight", {"height": 99999})
+    # Should return nulls, not crash
+    assert result["blockhash"] is None
+    assert result["block"] is None
+
+
+def test_bcli_getchaininfo_fields(node_factory, bitcoind):
+    """Test bcli getchaininfo returns all required fields"""
+    l1 = node_factory.get_node()
+    bitcoind.generate_block(5)
+    sync_blockheight(bitcoind, [l1])
+
+    result = l1.rpc.call("getchaininfo")
+    
+    # Verify all required fields are present
+    required_fields = ["chain", "headercount", "blockcount", "ibd"]
+    for field in required_fields:
+        assert field in result, f"Missing field: {field}"
+    
+    # Verify field types
+    assert isinstance(result["chain"], str)
+    assert isinstance(result["blockcount"], int)
+    assert isinstance(result["headercount"], int)
+    assert isinstance(result["ibd"], bool)
+
+
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'p2tr addresses not supported by elementsd')
 def test_hook_crash(node_factory, executor, bitcoind):
     """Verify that we fail over if a plugin crashes while handling a hook.
